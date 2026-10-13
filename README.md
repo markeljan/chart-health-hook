@@ -1,46 +1,65 @@
 # Chart Health Hook
 
-A Uniswap v4 hook that judges every swap by what it does to the **health of the chart**, and stamps the trader with a **soulbound ERC-1155 badge**.
+A Uniswap v4 dynamic-fee hook that charges each swap based on what it does to the chart, and gives loyal, well-timed traders a discount.
 
-Built for the Uniswap v4 Hooks Incubator ("Build your first hook"), on top of [haardikk21/points-hook](https://github.com/haardikk21/points-hook). The original `PointsHook` is kept in `src/` for reference.
+- **Buying strength (top blasting) or the dip (supporting)** is cheap.
+- **Selling into strength (extracting) or at the bottom (paper hands)** is expensive.
+- **Traders with a good track record** get up to a configurable discount on every fee.
 
-## The idea
+Everything is in one contract: [`src/ChartHealthHook.sol`](src/ChartHealthHook.sol).
 
-Top blasters push the chart up and get rewarded. Dip buyers support the chart and get rewarded. Selling into strength marks you as an extractor, and dumping at the bottom marks you as paper hands.
+## How it works
 
-| Price zone (vs. recent range) | Buy TOKEN | Sell TOKEN |
+**1. Read the chart.** For each pool, the hook keeps the TOKEN price high and low over a rolling window: the current candle plus the previous one. Before every swap, it places the current price in that range:
+
+- **Top:** the upper 25% of the range.
+- **Bottom:** the lower 25%.
+- **Neutral:** anywhere in between. A range narrower than `minRangeTicks` counts as a flat chart, so every swap there is neutral.
+
+**2. Charge a fee for that zone and direction** (example defaults):
+
+| Zone | Buy TOKEN | Sell TOKEN |
 |---|---|---|
-| **Top** (upper 25%) | 🚀 `TOP_BLASTER` (id 0, score +2x) | 🧛 `EXTRACTOR` (id 2, score −1x) |
-| **Bottom** (lower 25%) | 💎 `SUPPORTER` (id 1, score +1x) | 🧻 `PAPER_HANDS` (id 3, score −2x) |
-| Middle, or flat chart | nothing | nothing |
+| Top | 0.10% (top blaster) | 1.00% (extractor) |
+| Neutral or flat | 0.30% | 0.30% |
+| Bottom | 0.20% (supporter) | 2.00% (paper hands) |
 
-- **Badge amount** = ETH volume of the swap (in wei).
-- **`chartScore(address)`** is one signed reputation number per wallet: the sum of `weight × ETH volume` over all badges earned. Positive means supportive, negative means extractive.
-- **Soulbound.** `safeTransferFrom`, `safeBatchTransferFrom` and `setApprovalForAll` all revert with `Soulbound()`. Your badges stay with you.
+The penalty is attached to the trade itself, so it applies to every wallet and every router, aggregators included.
 
-A project can use the badges or the score to airdrop to supporters, gate perks, or flag extractors.
+**3. Build a score and earn a discount.** The hook identifies traders who swap through a **trusted router**, meaning one that exposes the real trader via `IMsgSender.msgSender()`, such as Uniswap's Universal Router.
 
-## How "high" and "low" are measured
+- **Score:** each trusted trade changes the trader's public on-chain `score` by its ETH volume times a weight:
 
-The hook keeps two **candles** (fixed time buckets, `candlePeriod` seconds each) per pool: the previous one and the current one. Each candle tracks the high, low and close of the TOKEN price in ticks.
+  | Top blaster | Supporter | Extractor | Paper hands |
+  |---|---|---|---|
+  | +2 | +1 | −2 | −2 |
 
-- The **recent range** is the min low and max high across both candles, so it covers the last 1–2 candle periods.
-- A swap is classified by the **pre-swap price**, meaning where the chart was when you traded. In v4, price only moves through swaps, so this is the last recorded close.
-- If the range is narrower than `minRangeTicks`, the chart counts as flat and no badges are minted.
-- If no one trades for a full candle period, the old range rolls out of the window.
+- **Discount:** grows linearly with a positive score, reaching `maxDiscountBps` at `fullDiscountScore`.
+- **Discount-only:** a negative score adds no extra penalty, because a fresh wallet would dodge it. Bad timing is already priced into each trade.
+- **Other routers:** swaps through any other router pay the zone fee, with no score and no discount.
 
-Pool ticks price currency1 in currency0 (TOKEN per ETH), so the hook stores `tokenTick = -poolTick`. Higher then means a stronger TOKEN.
+Any contract can read `score(address)` and `discountBps(address)`, for example to run airdrops, gate perks, or label wallets.
 
-## Hook details
+## Configuration
 
-- Permissions: `afterInitialize` (seeds the first candle) and `afterSwap` (classifies the swap, mints the badge, updates the candle).
-- Supported pools: ETH/TOKEN pools (`currency0` = native ETH). Other pools are ignored.
-- The trader is identified the same way as in PointsHook: `hookData = abi.encode(userAddress)`. With no hookData, no badges are minted.
-- Constructor: `ChartHealthHook(IPoolManager manager, uint64 candlePeriod, int24 minRangeTicks)`.
-- Views: `getRange(poolId)`, `currentZone(poolId)`, `getChart(poolId)`, `chartScore(user)`, `badgeWeight(badge)`.
-- Event: `BadgeEarned(user, poolId, badge, ethAmount, newScore)`.
+All settings are fixed at deployment through the `Config` struct:
 
-## Run it
+| Field | Example | Meaning |
+|---|---|---|
+| `candlePeriod` | `3600` | Candle length in seconds. The range covers the last 1–2 candles. |
+| `minRangeTicks` | `100` | Below this range width, the chart counts as flat. |
+| `neutralFee` | `3000` | Fees are in hundredths of a bip: `3000` = 0.30%, `100000` = 10%. Max `1000000` (100%). |
+| `topBuyFee`, `bottomBuyFee`, `topSellFee`, `bottomSellFee` | `1000`, `2000`, `10000`, `20000` | Fee per zone and direction. |
+| `fullDiscountScore` | `1 ether` | Score needed for the max discount. A good starting point is about 10× a typical buy. |
+| `maxDiscountBps` | `5000` | Max discount: `5000` = 50% off, `10000` = 100% off. |
+
+Trusted routers are passed to the constructor as an `address[]`.
+
+The pool must be **ETH/TOKEN** (`currency0` = native ETH) and created with `LPFeeLibrary.DYNAMIC_FEE_FLAG`. Initializing any other pool reverts with `InvalidPool`.
+
+Because a hook is permanently tied to its pools, changing the settings means deploying a new hook and pool.
+
+## Run
 
 ```bash
 git clone --recursive https://github.com/Markeljan/chart-health-hook
@@ -48,19 +67,10 @@ cd chart-health-hook
 forge test
 ```
 
-The tests in `test/ChartHealthHook.t.sol` cover:
+The tests use Uniswap's real `V4Router` (`MockV4Router` from v4-periphery) as the trusted router and `PoolSwapTest` as an untrusted one. They read the fee actually charged from the PoolManager's `Swap` event.
 
-- a flat chart minting no badges
-- range tracking
-- each of the four badges and its score weight
-- dumping from the top counting as extraction
-- no hookData meaning no badges
-- the candle window surviving one period and resetting after a quiet period
-- soulbound transfer and approval reverts
-- score accumulating across badges
+To deploy, mine a hook address with the `AFTER_INITIALIZE`, `BEFORE_SWAP` and `AFTER_SWAP` flags (for example with v4-periphery's `HookMiner`).
 
-## Limitations and ideas
+---
 
-- `hookData` is self-reported, so a router can claim any address. A production version should identify the trader through a trusted router or `msg.sender` allowlist.
-- Classification uses a simple 2-candle high/low range. TWAP, longer ring buffers, or momentum indicators could replace it.
-- Wash trading can farm positive badges. A real deployment would want fees, cooldowns, or volume caps.
+Built for the Uniswap v4 Hooks Incubator. Started from [haardikk21/points-hook](https://github.com/haardikk21/points-hook).

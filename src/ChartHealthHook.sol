@@ -2,51 +2,35 @@
 pragma solidity 0.8.26;
 
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
-import {ERC1155} from "solmate/src/tokens/ERC1155.sol";
+import {IMsgSender} from "v4-periphery/src/interfaces/IMsgSender.sol";
 
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {PoolId} from "v4-core/types/PoolId.sol";
-import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {SwapParams} from "v4-core/types/PoolOperation.sol";
-
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 /// @title ChartHealthHook
-/// @notice A Uniswap v4 hook that judges every swap by what it does to the "health of the chart".
+/// @notice Dynamic-fee hook for ETH/TOKEN pools that prices every swap by what it does to the chart.
 ///
-/// For ETH/TOKEN pools (currency0 = native ETH) the hook keeps a rolling price range made of the
-/// current and previous "candles" (fixed time buckets). Before each swap moves the price, the hook
-/// looks at where the TOKEN price sits inside that range:
+/// The hook tracks the TOKEN price over a rolling window (current + previous candle) and charges:
 ///
-///   - top zone    (upper 25% of the range) -> the chart is strong / trending up
-///   - bottom zone (lower 25% of the range) -> the chart is weak / dipping
+///   |                     | buy TOKEN                | sell TOKEN               |
+///   |---------------------|--------------------------|--------------------------|
+///   | top 25% of range    | topBuyFee    (top blast) | topSellFee   (extract)   |
+///   | middle / flat chart | neutralFee               | neutralFee               |
+///   | bottom 25% of range | bottomBuyFee (support)   | bottomSellFee (paper hands) |
 ///
-/// and mints a soulbound ERC-1155 badge to the trader:
-///
-///   | zone   | buy TOKEN          | sell TOKEN          |
-///   |--------|--------------------|---------------------|
-///   | top    | TOP_BLASTER  (+2x) | EXTRACTOR    (-1x)  |
-///   | bottom | SUPPORTER    (+1x) | PAPER_HANDS  (-2x)  |
-///
-/// The badge amount equals the ETH volume of the swap. Every badge also moves a single signed
-/// `chartScore` per wallet using the weights above, so projects can use either the individual
-/// badges or one reputation number to reward supporters and flag extractors.
-///
-/// Badges are non-transferable: all transfers and approvals revert.
-contract ChartHealthHook is BaseHook, ERC1155 {
-    // ---------------------------------------------------------------------
-    // Types
-    // ---------------------------------------------------------------------
-
-    enum Badge {
-        TOP_BLASTER, // id 0: bought while the chart was ripping
-        SUPPORTER, // id 1: bought the dip
-        EXTRACTOR, // id 2: sold into strength
-        PAPER_HANDS // id 3: sold the bottom
-    }
+/// Traders coming through a trusted router (one that exposes the real trader via `msgSender()`)
+/// build a public on-chain `score` (+2 top blast, +1 support, -2 extract, -2 paper hands, per ETH)
+/// and get up to `maxDiscountBps` off every fee as their score approaches `fullDiscountScore`.
+contract ChartHealthHook is BaseHook {
+    using StateLibrary for IPoolManager;
+    using LPFeeLibrary for uint24;
 
     enum Zone {
         NEUTRAL,
@@ -54,9 +38,7 @@ contract ChartHealthHook is BaseHook, ERC1155 {
         BOTTOM
     }
 
-    /// @notice One time bucket of TOKEN price action, expressed in "token ticks".
-    /// @dev Pool ticks price currency1 in currency0 (TOKEN per ETH), so a higher TOKEN price
-    ///      means a lower pool tick. We store `tokenTick = -poolTick` so that high == strong.
+    /// @dev Prices are stored as `-poolTick`: pool ticks price TOKEN per ETH, so negating makes higher = stronger TOKEN.
     struct Candle {
         uint64 start;
         int24 high;
@@ -64,123 +46,118 @@ contract ChartHealthHook is BaseHook, ERC1155 {
         int24 close;
     }
 
-    struct ChartState {
+    struct Chart {
         Candle prev;
         Candle curr;
-        bool hasPrev;
     }
 
-    // ---------------------------------------------------------------------
-    // Config
-    // ---------------------------------------------------------------------
+    struct Config {
+        uint64 candlePeriod; // seconds per candle; the range covers the last 1-2 candles
+        int24 minRangeTicks; // narrower ranges count as a flat chart (neutral fee, no score)
+        uint24 neutralFee; // fees in hundredths of a bip: 3000 = 0.30%, max 1_000_000 = 100%
+        uint24 topBuyFee;
+        uint24 bottomBuyFee;
+        uint24 topSellFee;
+        uint24 bottomSellFee;
+        uint256 fullDiscountScore; // score (in wei of ETH) that unlocks the max discount
+        uint256 maxDiscountBps; // max discount off the fee: 5000 = 50%, 10000 = 100%
+    }
 
-    /// @notice Width of the top / bottom zones as a share of the range (basis points).
-    uint256 public constant ZONE_BPS = 2_500;
+    int256 public constant ZONE_BPS = 2_500;
 
-    /// @notice Length of one candle in seconds.
     uint64 public immutable candlePeriod;
-
-    /// @notice Range (in ticks) below which the chart is considered flat and no badges are minted.
     int24 public immutable minRangeTicks;
+    uint24 public immutable neutralFee;
+    uint24 public immutable topBuyFee;
+    uint24 public immutable bottomBuyFee;
+    uint24 public immutable topSellFee;
+    uint24 public immutable bottomSellFee;
+    uint256 public immutable fullDiscountScore;
+    uint256 public immutable maxDiscountBps;
 
-    // ---------------------------------------------------------------------
-    // State
-    // ---------------------------------------------------------------------
+    mapping(address router => bool) public trustedRouter;
+    mapping(address trader => int256) public score;
+    mapping(PoolId => Chart) public charts;
 
-    mapping(PoolId => ChartState) internal _charts;
+    event ScoreUpdated(address indexed trader, int256 change, int256 newScore);
 
-    /// @notice Single reputation score per wallet. Positive = supportive, negative = extractive.
-    mapping(address => int256) public chartScore;
+    error InvalidConfig();
+    error InvalidPool();
 
-    // ---------------------------------------------------------------------
-    // Events / errors
-    // ---------------------------------------------------------------------
+    constructor(IPoolManager _manager, Config memory c, address[] memory routers) BaseHook(_manager) {
+        if (
+            c.candlePeriod == 0 || c.fullDiscountScore == 0 || c.maxDiscountBps > 10_000
+                || c.neutralFee > LPFeeLibrary.MAX_LP_FEE || c.topBuyFee > LPFeeLibrary.MAX_LP_FEE
+                || c.bottomBuyFee > LPFeeLibrary.MAX_LP_FEE || c.topSellFee > LPFeeLibrary.MAX_LP_FEE
+                || c.bottomSellFee > LPFeeLibrary.MAX_LP_FEE
+        ) revert InvalidConfig();
 
-    event BadgeEarned(
-        address indexed user, PoolId indexed poolId, Badge indexed badge, uint256 ethAmount, int256 newScore
-    );
+        candlePeriod = c.candlePeriod;
+        minRangeTicks = c.minRangeTicks;
+        neutralFee = c.neutralFee;
+        topBuyFee = c.topBuyFee;
+        bottomBuyFee = c.bottomBuyFee;
+        topSellFee = c.topSellFee;
+        bottomSellFee = c.bottomSellFee;
+        fullDiscountScore = c.fullDiscountScore;
+        maxDiscountBps = c.maxDiscountBps;
 
-    error Soulbound();
-
-    constructor(IPoolManager _manager, uint64 _candlePeriod, int24 _minRangeTicks) BaseHook(_manager) {
-        candlePeriod = _candlePeriod;
-        minRangeTicks = _minRangeTicks;
+        for (uint256 i; i < routers.length; i++) {
+            trustedRouter[routers[i]] = true;
+        }
     }
 
-    // ---------------------------------------------------------------------
-    // Hook config
-    // ---------------------------------------------------------------------
-
-    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        return Hooks.Permissions({
-            beforeInitialize: false,
-            afterInitialize: true,
-            beforeAddLiquidity: false,
-            beforeRemoveLiquidity: false,
-            afterAddLiquidity: false,
-            afterRemoveLiquidity: false,
-            beforeSwap: false,
-            afterSwap: true,
-            beforeDonate: false,
-            afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: false,
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
-        });
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory p) {
+        p.afterInitialize = true;
+        p.beforeSwap = true;
+        p.afterSwap = true;
     }
 
     // ---------------------------------------------------------------------
     // Hook callbacks
     // ---------------------------------------------------------------------
 
-    function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick)
-        internal
-        override
-        returns (bytes4)
-    {
-        int24 tokenTick = -tick;
-        _charts[key.toId()].curr = Candle({start: _bucket(block.timestamp), high: tokenTick, low: tokenTick, close: tokenTick});
+    /// @dev Only ETH/TOKEN dynamic-fee pools. Seeds the chart with the starting price.
+    function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick) internal override returns (bytes4) {
+        if (!key.currency0.isAddressZero() || !key.fee.isDynamicFee()) revert InvalidPool();
+        Candle memory c = Candle(_bucket(), -tick, -tick, -tick);
+        charts[key.toId()] = Chart(c, c);
         return this.afterInitialize.selector;
     }
 
+    /// @dev Update the chart with the pre-swap price, then charge the fee for this zone and direction.
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+        internal
+        override
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        PoolId id = key.toId();
+        (, int24 tick,,) = poolManager.getSlot0(id);
+        Chart storage chart = charts[id];
+        _record(chart, -tick);
+
+        uint24 fee = _baseFee(_zone(chart), params.zeroForOne);
+        fee -= uint24(fee * discountBps(_trader(sender)) / 10_000);
+        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+    }
+
+    /// @dev Score trusted traders by ETH volume. The zone is unchanged since beforeSwap.
     function _afterSwap(
-        address,
+        address sender,
         PoolKey calldata key,
-        SwapParams calldata swapParams,
+        SwapParams calldata params,
         BalanceDelta delta,
-        bytes calldata hookData
+        bytes calldata
     ) internal override returns (bytes4, int128) {
-        // Only ETH/TOKEN pools are tracked
-        if (!key.currency0.isAddressZero()) return (this.afterSwap.selector, 0);
+        address trader = _trader(sender);
+        int256 weight = _weight(_zone(charts[key.toId()]), params.zeroForOne);
 
-        PoolId poolId = key.toId();
-        ChartState storage chart = _charts[poolId];
-
-        // Roll candles forward if time has passed, then classify using the pre-swap price.
-        // Price in v4 only moves through swaps, so the last candle close is the pre-swap price.
-        _roll(chart);
-        Zone zone = _zone(chart, chart.curr.close);
-
-        // Record the post-swap price into the current candle
-        (, int24 tick,,) = _getSlot0(poolId);
-        _record(chart.curr, -tick);
-
-        if (zone == Zone.NEUTRAL) return (this.afterSwap.selector, 0);
-
-        // ETH volume of the swap, in either direction
-        int128 amount0 = delta.amount0();
-        uint256 ethAmount = uint256(int256(amount0 < 0 ? -amount0 : amount0));
-
-        // zeroForOne = ETH in, TOKEN out = buying TOKEN
-        Badge badge;
-        if (swapParams.zeroForOne) {
-            badge = zone == Zone.TOP ? Badge.TOP_BLASTER : Badge.SUPPORTER;
-        } else {
-            badge = zone == Zone.TOP ? Badge.EXTRACTOR : Badge.PAPER_HANDS;
+        if (trader != address(0) && weight != 0) {
+            int256 eth = delta.amount0();
+            int256 change = weight * (eth < 0 ? -eth : eth);
+            score[trader] += change;
+            emit ScoreUpdated(trader, change, score[trader]);
         }
-
-        _award(poolId, hookData, badge, ethAmount);
         return (this.afterSwap.selector, 0);
     }
 
@@ -188,126 +165,70 @@ contract ChartHealthHook is BaseHook, ERC1155 {
     // Views
     // ---------------------------------------------------------------------
 
-    /// @notice Rolling TOKEN price range (in token ticks) used to judge swaps.
-    function getRange(PoolId poolId) public view returns (int24 low, int24 high) {
-        ChartState storage chart = _charts[poolId];
-        return _range(chart);
-    }
-
-    /// @notice Which zone a swap would be judged in right now.
-    function currentZone(PoolId poolId) external view returns (Zone) {
-        ChartState storage chart = _charts[poolId];
-        return _zone(chart, chart.curr.close);
-    }
-
-    function getChart(PoolId poolId) external view returns (ChartState memory) {
-        return _charts[poolId];
-    }
-
-    function badgeWeight(Badge badge) public pure returns (int256) {
-        if (badge == Badge.TOP_BLASTER) return 2;
-        if (badge == Badge.SUPPORTER) return 1;
-        if (badge == Badge.EXTRACTOR) return -1;
-        return -2; // PAPER_HANDS
-    }
-
-    function uri(uint256 id) public pure override returns (string memory) {
-        if (id == uint256(Badge.TOP_BLASTER)) return "data:,Top Blaster";
-        if (id == uint256(Badge.SUPPORTER)) return "data:,Supporter";
-        if (id == uint256(Badge.EXTRACTOR)) return "data:,Extractor";
-        if (id == uint256(Badge.PAPER_HANDS)) return "data:,Paper Hands";
-        return "";
-    }
-
-    // ---------------------------------------------------------------------
-    // Soulbound: disable transfers and approvals
-    // ---------------------------------------------------------------------
-
-    function setApprovalForAll(address, bool) public pure override {
-        revert Soulbound();
-    }
-
-    function safeTransferFrom(address, address, uint256, uint256, bytes calldata) public pure override {
-        revert Soulbound();
-    }
-
-    function safeBatchTransferFrom(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
-        public
-        pure
-        override
-    {
-        revert Soulbound();
+    /// @notice Discount off the fee, scaling linearly with a positive score up to `maxDiscountBps`.
+    function discountBps(address trader) public view returns (uint256) {
+        int256 s = score[trader];
+        if (s <= 0) return 0;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 positive = uint256(s); // safe: s > 0
+        if (positive >= fullDiscountScore) return maxDiscountBps;
+        return positive * maxDiscountBps / fullDiscountScore;
     }
 
     // ---------------------------------------------------------------------
     // Internal
     // ---------------------------------------------------------------------
 
-    function _award(PoolId poolId, bytes calldata hookData, Badge badge, uint256 ethAmount) internal {
-        // Same convention as PointsHook: the trader's address is passed in hookData
-        if (hookData.length == 0 || ethAmount == 0) return;
-        address user = abi.decode(hookData, (address));
-        if (user == address(0)) return;
-
-        int256 newScore = chartScore[user] + badgeWeight(badge) * int256(ethAmount);
-        chartScore[user] = newScore;
-
-        _mint(user, uint256(badge), ethAmount, "");
-        emit BadgeEarned(user, poolId, badge, ethAmount, newScore);
+    /// @dev The real trader for trusted routers, address(0) (no score, no discount) for everyone else.
+    function _trader(address sender) internal view returns (address) {
+        return trustedRouter[sender] ? IMsgSender(sender).msgSender() : address(0);
     }
 
-    function _bucket(uint256 timestamp) internal view returns (uint64) {
-        return uint64(timestamp - (timestamp % candlePeriod));
+    function _baseFee(Zone zone, bool isBuy) internal view returns (uint24) {
+        if (zone == Zone.TOP) return isBuy ? topBuyFee : topSellFee;
+        if (zone == Zone.BOTTOM) return isBuy ? bottomBuyFee : bottomSellFee;
+        return neutralFee;
     }
 
-    /// @dev Start a new candle when the current one has expired.
-    function _roll(ChartState storage chart) internal {
-        uint64 nowBucket = _bucket(block.timestamp);
-        Candle memory curr = chart.curr;
-        if (nowBucket == curr.start) return;
+    function _weight(Zone zone, bool isBuy) internal pure returns (int256) {
+        if (zone == Zone.TOP) return isBuy ? int256(2) : -2;
+        if (zone == Zone.BOTTOM) return isBuy ? int256(1) : -2;
+        return 0;
+    }
 
-        if (nowBucket == curr.start + candlePeriod) {
-            // Consecutive candle: previous candle keeps its full range
+    function _bucket() internal view returns (uint64) {
+        return uint64(block.timestamp - block.timestamp % candlePeriod);
+    }
+
+    /// @dev Record the current price into the candle it was reached in, then roll to a new candle if time has passed.
+    function _record(Chart storage chart, int24 price) internal {
+        Candle storage curr = chart.curr;
+        if (price > curr.high) curr.high = price;
+        if (price < curr.low) curr.low = price;
+        curr.close = price;
+
+        uint64 bucket = _bucket();
+        if (bucket == curr.start) return;
+
+        if (bucket == curr.start + candlePeriod) {
             chart.prev = curr;
         } else {
-            // Gap with no trading: the price sat flat at the last close for the whole previous period
-            chart.prev = Candle({start: nowBucket - candlePeriod, high: curr.close, low: curr.close, close: curr.close});
+            // No trades for a whole candle: the price sat flat
+            chart.prev = Candle(bucket - candlePeriod, price, price, price);
         }
-        chart.hasPrev = true;
-        chart.curr = Candle({start: nowBucket, high: curr.close, low: curr.close, close: curr.close});
+        chart.curr = Candle(bucket, price, price, price);
     }
 
-    function _record(Candle storage candle, int24 tokenTick) internal {
-        if (tokenTick > candle.high) candle.high = tokenTick;
-        if (tokenTick < candle.low) candle.low = tokenTick;
-        candle.close = tokenTick;
-    }
+    function _zone(Chart storage chart) internal view returns (Zone) {
+        int256 high = chart.prev.high > chart.curr.high ? chart.prev.high : chart.curr.high;
+        int256 low = chart.prev.low < chart.curr.low ? chart.prev.low : chart.curr.low;
+        int256 width = high - low;
+        if (width < minRangeTicks) return Zone.NEUTRAL;
 
-    function _range(ChartState storage chart) internal view returns (int24 low, int24 high) {
-        low = chart.curr.low;
-        high = chart.curr.high;
-        if (chart.hasPrev) {
-            if (chart.prev.low < low) low = chart.prev.low;
-            if (chart.prev.high > high) high = chart.prev.high;
-        }
-    }
-
-    function _zone(ChartState storage chart, int24 tokenTick) internal view returns (Zone) {
-        (int24 low, int24 high) = _range(chart);
-        int256 width = int256(high) - int256(low);
-        if (width < int256(minRangeTicks)) return Zone.NEUTRAL;
-
-        int256 band = width * int256(ZONE_BPS) / 10_000;
-        if (int256(tokenTick) >= int256(high) - band) return Zone.TOP;
-        if (int256(tokenTick) <= int256(low) + band) return Zone.BOTTOM;
+        int256 band = width * ZONE_BPS / 10_000;
+        int256 price = chart.curr.close;
+        if (price >= high - band) return Zone.TOP;
+        if (price <= low + band) return Zone.BOTTOM;
         return Zone.NEUTRAL;
-    }
-
-    function _getSlot0(PoolId poolId)
-        internal
-        view
-        returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)
-    {
-        return StateLibrary.getSlot0(poolManager, poolId);
     }
 }

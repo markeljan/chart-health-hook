@@ -2,11 +2,13 @@
 src = "src"
 out = "out"
 libs = ["lib"]
-
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
-
-solc_version = '0.8.26'
+solc_version = "0.8.26"
 evm_version = "cancun"
 optimizer_runs = 800
-via_ir = false
-ffi = true
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "v4-periphery/=lib/v4-periphery/",
+    "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+    "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/",
+    "permit2/=lib/v4-periphery/lib/permit2/",
+]
