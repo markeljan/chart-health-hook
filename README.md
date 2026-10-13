@@ -1,160 +1,66 @@
-# Building your first hook
+# Chart Health Hook
 
-A really simple "points hook"
+A Uniswap v4 hook that judges every swap by what it does to the **health of the chart**, and stamps the trader with a **soulbound ERC-1155 badge**.
 
-Assume you have some ETH/TOKEN pool that exists. We wanna make a hook that can be attached
-to such kinds of pools where:
+Built for the Uniswap v4 Hooks Incubator ("Build your first hook"), on top of [haardikk21/points-hook](https://github.com/haardikk21/points-hook). The original `PointsHook` is kept in `src/` for reference.
 
-every time somebody swaps ETH for TOKEN (i.e. spends ETH, purchases TOKEN) - we issue them some "points"
+## The idea
 
-> This is not production ready by any means. It is a PoC.
+Top blasters push the chart up and get rewarded. Dip buyers support the chart and get rewarded. Selling into strength marks you as an extractor, and dumping at the bottom marks you as paper hands.
 
-### Design
+| Price zone (vs. recent range) | Buy TOKEN | Sell TOKEN |
+|---|---|---|
+| **Top** (upper 25%) | 🚀 `TOP_BLASTER` (id 0, score +2x) | 🧛 `EXTRACTOR` (id 2, score −1x) |
+| **Bottom** (lower 25%) | 💎 `SUPPORTER` (id 1, score +1x) | 🧻 `PAPER_HANDS` (id 3, score −2x) |
+| Middle, or flat chart | nothing | nothing |
 
-1. how many points do we give out per swap?
+- **Badge amount** = ETH volume of the swap (in wei).
+- **`chartScore(address)`** is one signed reputation number per wallet: the sum of `weight × ETH volume` over all badges earned. Positive means supportive, negative means extractive.
+- **Soulbound.** `safeTransferFrom`, `safeBatchTransferFrom` and `setApprovalForAll` all revert with `Soulbound()`. Your badges stay with you.
 
-we're going to give 20% of the ETH spent in the swap in the form of points
+A project can use the badges or the score to airdrop to supporters, gate perks, or flag extractors.
 
-e.g. if someone sells 1 ETH to purchase TOKEN, they get 20% of 1 = 0.2 POINTS
+## How "high" and "low" are measured
 
-2. how do we represent these points?
+The hook keeps two **candles** (fixed time buckets, `candlePeriod` seconds each) per pool: the previous one and the current one. Each candle tracks the high, low and close of the TOKEN price in ticks.
 
-points themselves are going to be an ERC-1155 token.
+- The **recent range** is the min low and max high across both candles, so it covers the last 1–2 candle periods.
+- A swap is classified by the **pre-swap price**, meaning where the chart was when you traded. In v4, price only moves through swaps, so this is the last recorded close.
+- If the range is narrower than `minRangeTicks`, the chart counts as flat and no badges are minted.
+- If no one trades for a full candle period, the old range rolls out of the window.
 
-ERC-1155 allows minting "x" number of tokens that are distinct based on some sort of "key"
+Pool ticks price currency1 in currency0 (TOKEN per ETH), so the hook stores `tokenTick = -poolTick`. Higher then means a stronger TOKEN.
 
-since one hook can be attached to multipple pools, ETH/A, ETH/B, ETH/C -
+## Hook details
 
-points = minting some amount of ERC-1155 tokens for that pool to the user
+- Permissions: `afterInitialize` (seeds the first candle) and `afterSwap` (classifies the swap, mints the badge, updates the candle).
+- Supported pools: ETH/TOKEN pools (`currency0` = native ETH). Other pools are ignored.
+- The trader is identified the same way as in PointsHook: `hookData = abi.encode(userAddress)`. With no hookData, no badges are minted.
+- Constructor: `ChartHealthHook(IPoolManager manager, uint64 candlePeriod, int24 minRangeTicks)`.
+- Views: `getRange(poolId)`, `currentZone(poolId)`, `getChart(poolId)`, `chartScore(user)`, `badgeWeight(badge)`.
+- Event: `BadgeEarned(user, poolId, badge, ethAmount, newScore)`.
 
-> Q: why not use ERC-6909 for doing this?
-> A: you totally can! erc-1155 is just a bit more familiar to people so for the first workshop i wanted to stick with this
+## Run it
 
----
-
-### beforeSwap vs afterSwap
-
-this balancedelta thing is actually quite important for us
-
-we're giving out points as a % of the amount of ETH that was spent in the swap
-
-how much ETH was spent in the swap?
-
-this is not a question that can be answered in `beforeSwap` because it is literally unknown until the swap happens
-
-1. potentially, slippage limits could hit causing only a partial swap to happen
-   e.g. Alice could've said sell 1 ETH for TOKEN, but slippage limit is hit, and only 0.5 ETH was actually swapped
-
-2. there are broadly two types of swaps that uniswap can do. these are referred to as exact-input and exact-output swaps.
-
-e.g. ETH/USDC pool. Alice wants to swap ETH for USDC.
-
-exact input variant = Sell 1 ETH for USDC
-e.g. she is "exactly" specifying how much ETH to sell, but not specifying how much USDC to get back
-
-exact output variant = Sell UP TO 1 ETH for exactly 1500 USDC
-e.g. she is "exactly" specifying how much USDC she wants back, and only a upper limit on how much ETH she's willing to spend
-
----
-
-the "BalanceDelta" thing we have in `afterSwap` becomes very crucial to our use case
-because `BalanceDelta` => the exact amount of tokens that need to be transferred (how much ETH was spent, how much TOKEN to withdraw)
-
-Tl;DR: we gotta use `afterSwap` because we do not know how much ETH Alice spent before the swap happens
-
-### minting points
-
-who do we actually mint points to
-
-does Uniswap (or our hook) have any idea who tf Alice is?
-do we have Alice's address?
-
-Alice -> Router -> PoolManager
--> msg.sender = Router
--> Hook.afterSwap(sender)
-sender = Router address
-msg.sender = Pool Manager
-
-ok we cannot use `sender` or `msg.sender`
-
-maybe we can use `tx.origin`. is that true?
-
-if Alice is using an account abstracted wallet (SC wallet)
-
-`tx.origin` = address of the relayer
-
-GENERAL PURPOSE: `tx.origin` doesnt work either
-
----
-
-how tf do we figure out who to mint points to
-
-we're gonna ask the user to give us an address to mint points to (optionally)
-
-if they dont specify an address/invalid address = dont mint any points
-
-#### hookData
-
-hookData allows users to pass in arbitrary information meant for use by the hook contract
-
-Alice -> Router.swap(...., hookData) -> PoolManager.swap(...., hookData) -> HookContract.before..(..., hookData)
-
-the hook contract can figure out what it wants to do with that hookData
-
-in our case, we're gonna use this as a way to ask the user for an address
-
-to illustrate the concept a bit better, a couple examples of better ways to use hookData
-
-e.g. KYC hook for example
-verify a ZK Proof that somebody is actually a verified human (World App ZK Proof)
-hook only lets you swap/become an LP if youre a human
-
-ZK Proof => hookData
-
-#### BalanceDelta
-
-effectively, for all intents and purposes, you can think of BalanceDelta as a struct with two values
-
-```
-struct BalanceDelta {
-    int128 amount0;
-    int128 amount1;
-}
+```bash
+git clone --recursive https://github.com/Markeljan/chart-health-hook
+cd chart-health-hook
+forge test
 ```
 
-for a given operation (e.g. a swap) the related `BalanceDelta` contains amounts of token0 and token1 that need to be moved around
+The tests in `test/ChartHealthHook.t.sol` cover:
 
-`amount0` => amount of token0
-`amount1` => amount of token1
+- a flat chart minting no badges
+- range tracking
+- each of the four badges and its score weight
+- dumping from the top counting as extraction
+- no hookData meaning no badges
+- the candle window surviving one period and resetting after a quiet period
+- soulbound transfer and approval reverts
+- score accumulating across badges
 
-NOTE: these amounts are `int`s and NOT `uint`s
-i.e. these can be negative numbers
+## Limitations and ideas
 
-in fact, in case of a swap, one of them will always be a negative number
-
-there's a convention that's followed in uniswap
-
-where everytime we talk about "money changing hands", we represent money coming in to uniswap and money going out of uniswap based on the sign of the numeric value
-
-this "direction" of a token transfer is represented from the perspective of the caller to uniswap
-
-+ve number => money is coming in to user's wallet (i.e. money is leaving Uniswap)
--ve number => money is leaving user's wallet (i.e. money is entering Uniswap)
-
-in the case of a Swap where youre exchanging one token for another
-
-imagine ETH/USDC pool, selling ETH for USDC, ETH is token0, USDC is token1
-
-```
-BalanceDelta {
-    amount0 = some negative number (amount of ETH being swapped),
-    amount1 = some positive number (amount of USDC being swapped)
-}
-```
-
-in the case of Adding Liquidity to a pool,
-
-(under the asumption you are adding both tokens as liquidity)
-
-amount0 = -ve
-amount1 = -ve
+- `hookData` is self-reported, so a router can claim any address. A production version should identify the trader through a trusted router or `msg.sender` allowlist.
+- Classification uses a simple 2-candle high/low range. TWAP, longer ring buffers, or momentum indicators could replace it.
+- Wash trading can farm positive badges. A real deployment would want fees, cooldowns, or volume caps.
