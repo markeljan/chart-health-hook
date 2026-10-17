@@ -166,8 +166,9 @@ The tests:
 ### Deploy
 
 ```bash
+# .env: PRIVATE_KEY, ETHERSCAN_API_KEY (never commit it, .env is gitignored)
 POOL_MANAGER=0x... TRUSTED_ROUTERS=0x...,0x... PRESET=trenches \
-forge script script/DeployChartHealthHook.s.sol --rpc-url $RPC_URL --private-key $PK --broadcast
+forge script script/DeployChartHealthHook.s.sol --rpc-url $RPC_URL --broadcast --verify
 ```
 
 - `PRESET` is one of `trenches`, `diamond`, `shield` or `custom`.

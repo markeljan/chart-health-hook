@@ -11,8 +11,8 @@ import {ChartHealthPresets} from "../src/ChartHealthPresets.sol";
 
 /// @notice Deploys a ChartHealthHook with a preset or a custom config.
 ///
-///   POOL_MANAGER=0x... TRUSTED_ROUTERS=0x...,0x... PRESET=trenches \
-///   forge script script/DeployChartHealthHook.s.sol --rpc-url $RPC_URL --private-key $PK --broadcast
+///   PRIVATE_KEY=0x... POOL_MANAGER=0x... TRUSTED_ROUTERS=0x...,0x... PRESET=trenches \
+///   forge script script/DeployChartHealthHook.s.sol --rpc-url $RPC_URL --broadcast --verify
 ///
 /// PRESET: trenches | diamond | shield | custom (edit `custom()` below)
 contract DeployChartHealthHook is Script {
@@ -28,8 +28,9 @@ contract DeployChartHealthHook is Script {
         (address expected, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(ChartHealthHook).creationCode, args);
 
-        vm.broadcast();
+        vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
         hook = new ChartHealthHook{salt: salt}(manager, config, routers);
+        vm.stopBroadcast();
         require(address(hook) == expected, "hook address mismatch");
         console.log("ChartHealthHook:", address(hook));
     }
