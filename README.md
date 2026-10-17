@@ -15,6 +15,15 @@ Loyal traders build an on-chain score that unlocks discounts.
 
 ---
 
+## 🟢 Live on Unichain Sepolia
+
+| | |
+|---|---|
+| **ChartHealthHook** (🔥 Trenches preset) | [`0x3D691434ba2B6f8Bb20a0a86B393c8641f8510C0`](https://sepolia.uniscan.xyz/address/0x3d691434ba2b6f8bb20a0a86b393c8641f8510c0#code) ✅ verified |
+| Deploy tx | [`0x1aea1efb…1d73ee2`](https://sepolia.uniscan.xyz/tx/0x1aea1efbe0a80e8bd91e4cc594835d9c1d76df34e54bed950b3c6e2fd1d73ee2) |
+| PoolManager | [`0x00b036b58a818b1bc34d502d3fe730db729e62ac`](https://sepolia.uniscan.xyz/address/0x00b036b58a818b1bc34d502d3fe730db729e62ac) |
+| Trusted routers | Universal Router [`0xf70536b3…a6be5d`](https://sepolia.uniscan.xyz/address/0xf70536b3bcc1bd1a972dc186a2cf84cc6da6be5d), Universal Router 2.1.2 [`0xDf38F24f…857E95`](https://sepolia.uniscan.xyz/address/0xDf38F24fE153761634Be942F9d859f3DBA857E95) |
+
 ## The game
 
 Every ETH/TOKEN swap is placed on the recent chart and lands in one of four roles:
